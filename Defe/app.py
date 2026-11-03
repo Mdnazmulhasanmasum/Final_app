@@ -1,12 +1,4 @@
-# #####################################################################################################################
-# APP BUILDER (FIXED) -- paste in ONE cell AFTER the Part-17 cell(s). Builds a complete, ready-to-deploy Streamlit app per model:
-#    brain_tumor_app_p15/ , _p16/ , _merged/    (app.py + requirements.txt + model/ + samples/ + README.md)  and their .zip files
-# #####################################################################################################################
-import shutil, zipfile
-from pathlib import Path
-
-WORK = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
-APP_PY = r'''import io, json, time, hashlib
+import io, json, time, hashlib
 from html import escape as esc
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -16,6 +8,9 @@ import numpy as np
 import onnxruntime as ort
 import streamlit as st
 from PIL import Image, ImageOps
+
+Image.MAX_IMAGE_PIXELS = 40_000_000   # refuse decompression-bomb sized images
+MAX_UPLOAD_MB = 15
 
 try:
     from reportlab.lib import colors
@@ -119,9 +114,29 @@ TEMP = max(float(meta.get("calibration", {}).get("temperature", 0.693)), 1e-4)
 SEG_IS_PROB = bool(meta.get("outputs", {}).get("segmentation_is_probability", False))
 IN_NAME = sess.get_inputs()[0].name
 OUT_NAMES = [o.name for o in sess.get_outputs()][:3]
-APP_DEF = meta.get("app_defaults", {})
-MIN_LESION_PCT = 0.40
-TZ = timezone(timedelta(hours=6))
+APP_DEF = meta.get("app_defaults", {})   # written by notebook Part 17 (picked from data)
+MIN_PX = max(int(meta.get("segmentation", {}).get("min_area_px", 20)), 20)
+AUTO_T = float(meta.get("triage", {}).get("auto", 0.88))      # >= auto  -> confident
+REVIEW_T = float(meta.get("triage", {}).get("review", 0.51))  # < review -> uncertain
+
+# ---- decision rules. Every number here can be overridden from meta.json -> "fusion"
+#      (write them from the notebook together with how they were picked, so the thesis can cite it).
+FUS = meta.get("fusion", {})
+DEC_THR = float(meta.get("segmentation", {}).get("threshold", 0.50))  # FIXED mask threshold that drives the diagnosis
+MIN_LESION_PCT = float(FUS.get("min_lesion_pct", 0.40))   # smaller mask area than this = "no lesion"
+COMP_MEAN = float(FUS.get("comp_mean", 0.60))             # a mask fragment must have this mean confidence ...
+COMP_PEAK = float(FUS.get("comp_peak", 0.80))             # ... and this peak confidence to survive clean-up
+STRONG_CONF = float(FUS.get("strong_lesion_conf", 0.85))  # "strong lesion": mean mask probability
+STRONG_CONS = float(FUS.get("strong_lesion_views", 0.60)) # ... seen in this fraction of views
+STRONG_AREA = float(FUS.get("strong_lesion_area", 1.0))   # ... and covering at least this % of the slice
+CONFLICT_PTUMOUR = float(FUS.get("conflict_p_tumour", 0.35))  # No_tumor head vs strong lesion: tumour prob >= this -> conflict
+CONFLICT_PCLEAR = float(FUS.get("conflict_p_clear", 0.60))    # No_tumor head vs any lesion: P(No_tumor) < this -> conflict
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Asia/Dhaka")
+except Exception:                       # tzdata missing (e.g. some Windows installs)
+    TZ = timezone(timedelta(hours=6))   # Bangladesh time
 
 # ───────────────────────── PIPELINE ─────────────────────────
 def auto_crop(pil):
@@ -162,6 +177,7 @@ def v_clahe(rgb):
 
 
 def v_clean(rgb):
+    """Median filter wipes thin watermark text / scratches but keeps the large structures."""
     return cv2.medianBlur(rgb, 5)
 
 
@@ -186,11 +202,75 @@ def v_zoom(rgb, f):
 
 
 def brain_mask(rgb):
+    """Soft mask of the head region, used to keep the attribution map off the background."""
     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     m = (g > 20).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
-    m = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    m = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))  # stay inside the skull ring
     return cv2.GaussianBlur(m.astype(np.float32), (0, 0), 4)
+
+
+def head_region(rgb):
+    """Filled head silhouette (not eroded, so tumours touching the skull are kept). Removes background/watermark blobs."""
+    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    m = (g > 20).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return np.ones(g.shape, bool)
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < g.size * 0.10:
+        return np.ones(g.shape, bool)
+    out = np.zeros(g.shape, np.uint8)
+    cv2.drawContours(out, [c], -1, 1, -1)
+    return out.astype(bool)
+
+
+def ood_flags(img_bytes, disp):
+    """Cheap checks that the upload looks like a grey-scale brain MRI slice. Returns a list of warnings.
+    It cannot prove the image is a brain MRI, it only catches obvious non-MRI input (colour photos, full-frame images)."""
+    flags = []
+    try:
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes))).convert("RGB")
+        im.thumbnail((256, 256))
+        a = np.asarray(im, np.int16)
+        chroma = float(np.abs(a[..., 0] - a[..., 1]).mean() + np.abs(a[..., 1] - a[..., 2]).mean())
+        if chroma > 12:
+            flags.append("The image is coloured, but MRI slices are normally grey-scale.")
+    except Exception:
+        pass
+    g = cv2.cvtColor(disp, cv2.COLOR_RGB2GRAY)
+    fg = float((g > 20).mean())
+    if fg < 0.15 or fg > 0.97:
+        flags.append("No clear head silhouette on a dark background was found.")
+    k = max(IMG // 10, 4)
+    corners = np.concatenate([g[:k, :k].ravel(), g[:k, -k:].ravel(), g[-k:, :k].ravel(), g[-k:, -k:].ravel()])
+    if float(corners.mean()) > 60:
+        flags.append("The image corners are bright, while a brain slice normally has a dark background.")
+    return flags
+
+
+def stretch(fn, *a, **k):
+    """Full-width widget on both new (width='stretch') and older (use_container_width) Streamlit versions."""
+    try:
+        return fn(*a, width="stretch", **k)
+    except Exception:
+        return fn(*a, use_container_width=True, **k)
+
+
+def clean_mask(sp, thr, region):
+    """Threshold, keep only the head region, then drop fragments that are tiny or weakly confident.
+    This is what removes most false-positive masks on healthy slices."""
+    m = (sp >= thr) & region
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    out = np.zeros(m.shape, bool)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < MIN_PX:
+            continue
+        comp = lab == i
+        if sp[comp].mean() >= COMP_MEAN and sp[comp].max() >= COMP_PEAK:
+            out |= comp
+    return out
 
 
 def run_once(t):
@@ -201,8 +281,12 @@ def run_once(t):
     return cls, seg, attr
 
 
-@st.cache_data(show_spinner="Analysing scan…", max_entries=24)
+@st.cache_data(show_spinner="Analysing scan…", max_entries=6, ttl=900)
 def infer(img_bytes, crop, robust, multiview):
+    """Cached, so sliders and toggles that don't change the network input never re-run it.
+    Multi-view = 10 views: original, flip, CLAHE, watermark-clean, 2 gammas, 2 zooms, 2 rotations.
+    Segmentation is averaged over every view that keeps the geometry (orig, flip, CLAHE, clean, gammas).
+    Saliency is averaged over original+flip only."""
     rgb = base_rgb(Image.open(io.BytesIO(img_bytes)), crop)
     t0 = time.perf_counter()
     c0, s0, a0 = run_once(to_tensor(rgb, robust))
@@ -224,7 +308,8 @@ def infer(img_bytes, crop, robust, multiview):
         for v in (v_zoom(rgb, 1.12), v_zoom(rgb, 0.88), v_rot(rgb, 7), v_rot(rgb, -7)):
             logits.append(run_once(to_tensor(v, robust))[0])
     seg = np.mean(segs, axis=0) if segs else None
-    return rgb, np.stack(logits), seg, attr, (time.perf_counter() - t0) * 1000
+    seg_views = np.stack(segs) if segs else None
+    return rgb, np.stack(logits), seg, seg_views, attr, (time.perf_counter() - t0) * 1000
 
 
 def softmax(z, temp=1.0):
@@ -247,7 +332,7 @@ def blend_mask(img, mask, alpha):
 
 def blend_heat(img, attr, alpha):
     heat = cv2.cvtColor(cv2.applyColorMap((attr * 255).astype(np.uint8), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
-    w = (attr[..., None] * alpha)
+    w = (attr[..., None] * alpha)  # fade out where attribution is ~0 so the scan stays readable
     return (img * (1 - w) + heat * w).astype(np.uint8)
 
 
@@ -278,7 +363,7 @@ def build_pdf(info, r, panels, captions):
     W = A4[0] - 2 * L
     ink, mute, line, acc = (colors.HexColor(c) for c in ("#0f172a", "#64748b", "#e2e8f0", "#0d9488"))
     ss = getSampleStyleSheet()
-    S = lambda n, **k: ParagraphStyle(n, parent=ss["Normal"], textColor=ink, **k)
+    S = lambda n, **k: ParagraphStyle(n, parent=ss["Normal"], **{"textColor": ink, **k})
     h1 = S("h1", fontName="Helvetica-Bold", fontSize=18, leading=22)
     sub = S("sub", fontSize=9, leading=12, textColor=mute)
     h2 = S("h2", fontName="Helvetica-Bold", fontSize=11, leading=14, spaceBefore=12, spaceAfter=5)
@@ -296,21 +381,21 @@ def build_pdf(info, r, panels, captions):
         return d
 
     story = [P("Brain MRI AI Analysis Report", h1),
-             P(f"TinyBrainNet-MT &middot; Khwaja Yunus Ali University &middot; Report ID {r['rid']}", sub),
+             P(f"RESEARCH PROTOTYPE &middot; TinyBrainNet-MT &middot; Khwaja Yunus Ali University &middot; Report ID {r['rid']}", sub),
              Spacer(1, 3), HRFlowable(width="100%", thickness=1.2, color=acc, spaceAfter=8)]
 
     cw = [27 * mm, W / 2 - 27 * mm] * 2
-    rows = [[P("Patient name", lab), P(latin(info["patient"]) or "-", val), P("Patient ID", lab), P(latin(info["pid"]) or "-", val)],
-            [P("Age / Sex", lab), P(latin(info["agesex"]) or "-", val), P("Report date", lab), P(info["date"], val)],
-            [P("Doctor", lab), P(latin(info["doctor"]) or "-", val), P("Designation", lab), P(latin(info["desig"]) or "-", val)],
-            [P("Facility", lab), P(latin(info["facility"]) or "-", val), P("Scan file", lab), P(r["sha"], val)]]
+    rows = [[P("Patient name", lab), P(latin(info["patient"]) or "Not provided", val), P("Patient ID", lab), P(latin(info["pid"]) or "Not provided", val)],
+            [P("Age / Sex", lab), P(latin(info["agesex"]) or "Not provided", val), P("Report date", lab), P(info["date"], val)],
+            [P("Doctor", lab), P(latin(info["doctor"]) or "Not provided", val), P("Designation", lab), P(latin(info["desig"]) or "Not provided", val)],
+            [P("Facility", lab), P(latin(info["facility"]) or "Not provided", val), P("Scan file", lab), P(r["sha"], val)]]
     t = Table(rows, colWidths=cw)
     t.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.4, line), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("LEFTPADDING", (0, 0), (-1, -1), 2)]))
     story += [t, P("AI findings", h2)]
 
     lv = {"High": "#16a34a", "Medium": "#d97706", "Low": "#dc2626"}[r["level"]]
-    res = Table([[P("Result", lab), P("Confidence", lab), P("Lesion area", lab), P("Reliability", lab)],
+    res = Table([[P("Result", lab), P(r["conf_label"], lab), P("Lesion area", lab), P("Reliability", lab)],
                  [P(latin(r["name"]), big), P(f'{r["conf"]*100:.1f}%', big), P(f'{r["area"]:.2f}%', big),
                   P(f'<font color="{lv}">{r["level"]}</font>', big)]],
                 colWidths=[W * .34, W * .22, W * .22, W * .22])
@@ -356,6 +441,13 @@ def build_pdf(info, r, panels, captions):
     story += [Spacer(1, 10), P("Settings: " + latin(r["settings"]), sub)]
 
     def footer(c, d):
+        c.saveState()                      # diagonal watermark (drawn first, so it sits behind the content)
+        c.setFillColor(colors.Color(0.5, 0.5, 0.5, alpha=0.10))
+        c.setFont("Helvetica-Bold", 54)
+        c.translate(A4[0] / 2, A4[1] / 2)
+        c.rotate(35)
+        c.drawCentredString(0, 0, "RESEARCH PROTOTYPE")
+        c.restoreState()
         c.saveState()
         c.setStrokeColor(line)
         c.line(L, 14 * mm, A4[0] - L, 14 * mm)
@@ -382,10 +474,21 @@ with st.sidebar:
                           help="Runs the scan 10 ways (original, flip, contrast, watermark-clean, 2 gammas, 2 zooms, "
                                "2 rotations) and averages. Steadier on photos and web images that look unlike the training data.")
     soften = st.toggle("Soften probabilities", True,
-                       help="Stops the model from showing 100% on scans it has never seen the like of.")
-    seg_thr = st.slider("Segmentation threshold", 0.10, 0.90, 0.50, 0.05)
+                       help=f"On: temperature is at least 1.0, so probabilities are never sharper than the raw softmax "
+                            f"(stops 100% on unfamiliar scans). Off: use the calibrated temperature from meta.json (T = {TEMP:.2f}).")
+    seg_thr = st.slider("Overlay mask threshold (display only)", 0.10, 0.90,
+                        float(np.clip(round(DEC_THR / 0.05) * 0.05, 0.10, 0.90)), 0.05,
+                        help=f"Only changes the red overlay. The diagnosis always uses the fixed threshold {DEC_THR:.2f}.")
     alpha = st.slider("Overlay strength", 0.1, 0.9, 0.50, 0.05)
     st.divider()
+    if st.button("Clear cached scans", help="Removes analysed scans from the server's memory."):
+        st.cache_data.clear()
+        st.toast("Cache cleared")
+    st.caption("Privacy: scans are kept in memory for at most 15 minutes. Do not upload identifiable patient scans to a public deployment.")
+    with st.expander("Report defaults (kept for every scan)"):
+        def_doctor = st.text_input("Doctor name", key="def_doctor", placeholder="Dr. ...")
+        def_desig = st.text_input("Designation / Reg. no.", key="def_desig")
+        def_facility = st.text_input("Hospital / Clinic", key="def_facility")
     st.caption("Khwaja Yunus Ali University · CSE thesis prototype")
 
 # ───────────────────────── HEADER + UPLOAD ─────────────────────────
@@ -402,10 +505,13 @@ elif sample_choice != "None":
 if img_bytes is None:
     st.caption("Drag and drop a scan above, or pick a sample from the sidebar.")
     st.stop()
+if len(img_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+    st.error(f"This file is larger than {MAX_UPLOAD_MB} MB. Please upload a smaller image.")
+    st.stop()
 
 # ───────────────────────── INFERENCE ─────────────────────────
 try:
-    disp, logits, seg_raw, attr_raw, ms = infer(img_bytes, crop, robust, multiview)
+    disp, logits, seg_raw, seg_views, attr_raw, ms = infer(img_bytes, crop, robust, multiview)
 except Exception as e:
     st.error(f"Could not analyse this image: {e}")
     st.stop()
@@ -417,31 +523,58 @@ pred = int(probs.argmax())
 conf = float(probs[pred])
 n_views = len(logits)
 agree = float((logits.argmax(1) == pred).mean())
+p_clear = float(probs[NO_TUMOR]) if NO_TUMOR is not None else 0.0
+p_tumour = 1.0 - p_clear
+pred_is_clear = NO_TUMOR is not None and pred == NO_TUMOR
 
+# ---- segmentation: clean the mask, then measure how consistent it is across views
+region = head_region(disp)
 if seg_raw is not None:
-    sp = seg_raw if SEG_IS_PROB else sigmoid(seg_raw)
-    sp = cv2.resize(sp.astype(np.float32), (IMG, IMG), interpolation=cv2.INTER_LINEAR)
-    mask = sp >= seg_thr
+    sig_ = (lambda x: x) if SEG_IS_PROB else sigmoid
+    sp = cv2.resize(sig_(seg_raw).astype(np.float32), (IMG, IMG), interpolation=cv2.INTER_LINEAR)
+    raw_area = float((sp >= DEC_THR).mean()) * 100
+    mask = clean_mask(sp, DEC_THR, region)
+    view_has = []
+    for sv in seg_views:
+        spv = cv2.resize(sig_(sv).astype(np.float32), (IMG, IMG), interpolation=cv2.INTER_LINEAR)
+        view_has.append(clean_mask(spv, DEC_THR, region).mean() * 100 >= MIN_LESION_PCT)
+    seg_cons = float(np.mean(view_has))
 else:
     sp = np.zeros((IMG, IMG), np.float32)
     mask = np.zeros((IMG, IMG), bool)
-
+    raw_area, seg_cons = 0.0, 0.0
 area = float(mask.mean()) * 100
 les_conf = float(sp[mask].mean()) if mask.any() else 0.0
 has_lesion = area >= MIN_LESION_PCT
+strong_lesion = has_lesion and les_conf >= STRONG_CONF and seg_cons >= STRONG_CONS and area >= STRONG_AREA
 
-pred_is_clear = NO_TUMOR is not None and pred == NO_TUMOR
+# ---- fuse the two heads into ONE decision (this replaces the old "two heads, two answers" behaviour)
+#   clear     : classifier No_tumor, no lesion
+#   fp        : classifier clearly No_tumor, mask is weak -> mask treated as false positive and hidden
+#   conflict  : classifier No_tumor but the lesion is strong / classifier not sure -> inconclusive, manual review
+#   tumour    : classifier tumour + lesion
+#   no_mask   : classifier tumour, no lesion outlined
+if pred_is_clear and not has_lesion:
+    state = "clear"
+elif pred_is_clear and has_lesion:
+    state = "conflict" if (strong_lesion and p_tumour >= CONFLICT_PTUMOUR) or p_clear < CONFLICT_PCLEAR else "fp"
+elif has_lesion:
+    state = "tumour"
+else:
+    state = "no_mask"
 
-# --- SMART CORRECTION / FIX FOR FALSE POSITIVE & MISMATCH ---
-# If classifier predicts No_tumor with reasonable confidence (> 65%), suppress minor false-positive segmentation noise (< 1.5% area)
-if pred_is_clear and conf > 0.65 and area < 1.5:
-    mask = np.zeros_like(mask)
-    area = 0.0
-    has_lesion = False
+if state == "fp":                       # hide the suspicious mask so the report is self-consistent
+    mask = np.zeros((IMG, IMG), bool)
+    area, les_conf = 0.0, 0.0
+conflict = state == "conflict"
 
-conflict = pred_is_clear and has_lesion             # classifier: no tumour / segmentation: mass
-empty_seg = (not pred_is_clear) and not has_lesion  # classifier: tumour / segmentation: nothing
+# Overlay follows the display slider; the diagnosis above never does.
+if seg_raw is not None and state in ("tumour", "conflict", "no_mask"):
+    mask_view = clean_mask(sp, seg_thr, region)
+else:
+    mask_view = np.zeros((IMG, IMG), bool)
 
+# Tumour type, ranked among tumour classes only (softened harder when the heads disagree)
 T_type = max(T, 2.0) if conflict else T
 tp = softmax(mean_logits[TUMOR_IDX], T_type)
 order = np.argsort(-tp)
@@ -449,35 +582,67 @@ n1, p1 = CLASSES[TUMOR_IDX[order[0]]], float(tp[order[0]])
 n2, p2 = (CLASSES[TUMOR_IDX[order[1]]], float(tp[order[1]])) if len(order) > 1 else ("", 0.0)
 type_rank = [(CLASSES[TUMOR_IDX[j]], float(tp[j])) for j in order]
 
-if conflict:
-    final_idx, final_conf = TUMOR_IDX[order[0]], p1
-else:
+conf_label = "Confidence"
+if state in ("clear", "fp"):
+    final_idx, final_name, final_conf = NO_TUMOR, "No_tumor", p_clear
+elif state == "tumour":
     final_idx, final_conf = pred, conf
-final_name = CLASSES[final_idx]
+    final_name = CLASSES[pred] if conf >= REVIEW_T else "Tumour (type uncertain)"
+elif state == "no_mask":
+    final_idx, final_conf = pred, conf
+    final_name = CLASSES[pred] if (conf >= AUTO_T and agree >= 0.8) else "Inconclusive"
+else:  # conflict
+    final_idx, final_name, final_conf = TUMOR_IDX[order[0]], "Inconclusive", p_tumour
+    conf_label = "Tumour probability"
+if state == "no_mask" and final_name == "Inconclusive":
+    conf_label = "Top-class prob."
 
-# Reliability
-heads_ok = not conflict and not empty_seg
-if conflict:
+# ---- reliability
+if state in ("conflict",) or (state == "no_mask" and final_name == "Inconclusive"):
     level = "Low"
 else:
-    score = 0.5 * conf + 0.5 * agree
-    level = "High" if score >= 0.85 and heads_ok else "Medium" if score >= 0.60 else "Low"
-    if not heads_ok and level == "High":
+    score = 0.5 * final_conf + 0.5 * agree
+    level = "High" if (score >= 0.85 and final_conf >= AUTO_T) else "Medium" if score >= 0.60 else "Low"
+    if state in ("fp", "no_mask") and level == "High":
         level = "Medium"
+    if state == "tumour" and (les_conf < 0.70 or seg_cons < 0.5) and level == "High":
+        level = "Medium"
+    if final_conf < REVIEW_T:
+        level = "Low"
+
+ood = ood_flags(img_bytes, disp)
+if ood:   # cap reliability when the input does not look like a brain MRI
+    rank = {"Low": 0, "Medium": 1, "High": 2}
+    cap_level = "Low" if len(ood) >= 2 else "Medium"
+    if rank[level] > rank[cap_level]:
+        level = cap_level
 
 checks = [(agree >= 0.8, f"{int(round(agree * n_views))} of {n_views} views give the same class.")]
-if conflict:
-    checks.append((False, f"Classifier says No_tumor but segmentation outlined {area:.2f}% of the slice."))
-elif empty_seg:
+if state == "conflict":
+    checks.append((False, f"Classifier says No_tumor ({p_clear*100:.0f}%) but segmentation outlined {area:.2f}% of the slice. Result held as inconclusive."))
+elif state == "fp":
+    checks.append((False, f"Weak mask ({raw_area:.2f}% before clean-up) on a scan the classifier calls No_tumor ({p_clear*100:.0f}%): treated as a false positive and hidden."))
+elif state == "no_mask":
     checks.append((False, f"Classifier says {CLASSES[pred]} but segmentation found no clear lesion."))
 else:
     checks.append((True, "Classifier and segmentation agree."))
-if has_lesion:
-    checks.append((les_conf >= 0.70, f"Lesion confidence (mean mask probability) {les_conf*100:.0f}%."))
+if raw_area > area + 0.05 and state != "fp":
+    checks.append((True, f"Clean-up removed {raw_area - area:.2f}% of weak or tiny mask fragments."))
+if has_lesion and state != "fp":
+    checks.append((les_conf >= 0.70, f"Lesion confidence (mean mask probability) {les_conf*100:.0f}%; lesion seen in {int(round(seg_cons*len(seg_views)))} of {len(seg_views)} views."))
+if final_conf >= AUTO_T:
+    checks.append((True, f"Confidence {final_conf*100:.0f}% is above the auto threshold ({AUTO_T*100:.0f}%)."))
+elif final_conf >= REVIEW_T:
+    checks.append((False, f"Confidence {final_conf*100:.0f}% is in the review band ({REVIEW_T*100:.0f}-{AUTO_T*100:.0f}%): a clinician should confirm."))
+else:
+    checks.append((False, f"Confidence {final_conf*100:.0f}% is below {REVIEW_T*100:.0f}%: the model is not sure."))
 if not multiview:
     checks.append((False, "Multi-view check is off. Turn it on for a steadier result."))
+for f_ in ood:
+    checks.append((False, "Input check: " + f_))
 checks.append((True, f"Analysed in {ms:.0f} ms on CPU."))
 
+# Saliency for the reported class, kept inside the head region
 attr = None
 if attr_raw is not None and attr_raw.ndim == 3:
     a = cv2.resize(np.maximum(attr_raw[final_idx if final_idx < attr_raw.shape[0] else 0], 0), (IMG, IMG), interpolation=cv2.INTER_CUBIC)
@@ -487,44 +652,59 @@ if attr_raw is not None and attr_raw.ndim == 3:
         attr = np.clip((a - lo) / (hi - lo), 0, 1)
 
 # ───────────────────────── RESULT ─────────────────────────
-if conflict:
-    title = "Lesion found, tumour type uncertain"
-    summary = (f"The segmentation head outlined a mass covering <b>{area:.2f}%</b> of the slice, but the classifier answered "
-               f"<b>No_tumor</b>. This usually means the scan looks different from the training data (watermark, contrast, "
-               f"scanner or view). Treat the type as a suggestion: most likely <b>{n1}</b> ({p1*100:.0f}%), then {n2} ({p2*100:.0f}%). "
-               f"Please review manually.")
-elif empty_seg:
-    title = f"{final_name} predicted, no clear lesion outlined"
-    summary = (f"The classifier favours <b>{final_name}</b> ({conf*100:.1f}%), but the segmentation head did not outline a lesion "
-               f"above the {seg_thr:.2f} threshold. Check the scan manually.")
-elif pred_is_clear:
+if state == "conflict":
+    title = "Inconclusive: classifier and segmentation disagree"
+    summary = (f"The classifier says <b>No_tumor</b> ({p_clear*100:.0f}%) but the segmentation head outlined a mass covering "
+               f"<b>{area:.2f}%</b> of the slice. No final diagnosis is given. If a tumour is present the closest type is "
+               f"<b>{n1}</b> ({p1*100:.0f}%), then {n2} ({p2*100:.0f}%). Please review manually.")
+elif state == "fp":
+    title = "No tumour detected (weak mask hidden)"
+    summary = (f"<b>No_tumor</b> at {p_clear*100:.1f}%. A faint mask ({raw_area:.2f}% before clean-up) was removed as a probable "
+               f"false positive. Reliability is capped at Medium.")
+elif state == "no_mask":
+    if final_name == "Inconclusive":
+        title = "Inconclusive: tumour suspected, no lesion outlined"
+        summary = (f"The classifier leans to <b>{CLASSES[pred]}</b> ({conf*100:.1f}%) but is below the auto threshold and the segmentation "
+                   f"head found no lesion at threshold {DEC_THR:.2f}. Check the scan manually.")
+    else:
+        title = f"{final_name} predicted, no clear lesion outlined"
+        summary = (f"The classifier is confident about <b>{final_name}</b> ({conf*100:.1f}%), but the segmentation head did not outline a "
+                   f"lesion above the {DEC_THR:.2f} threshold. Check the scan manually.")
+elif state == "clear":
     title = "No tumour detected"
-    summary = f"Both heads agree. <b>No_tumor</b> at {conf*100:.1f}% confidence, no lesion outlined."
+    summary = f"Both heads agree. <b>No_tumor</b> at {p_clear*100:.1f}% confidence, no lesion outlined."
 else:
-    title = f"{final_name} detected"
-    summary = (f"Both heads agree. <b>{final_name}</b> at {conf*100:.1f}% confidence, lesion covers <b>{area:.2f}%</b> of the slice."
-               + ("" if level == "High" else " Reliability is not high, so review before relying on it."))
+    if final_name == "Tumour (type uncertain)":
+        title = "Tumour found, type uncertain"
+        summary = (f"Both heads see an abnormality (lesion {area:.2f}% of the slice) but the type confidence is only {conf*100:.0f}%. "
+                   f"Closest types: <b>{n1}</b> ({p1*100:.0f}%), then {n2} ({p2*100:.0f}%). Please review manually.")
+    else:
+        title = f"{final_name} detected"
+        summary = (f"Both heads agree. <b>{final_name}</b> at {conf*100:.1f}% confidence, lesion covers <b>{area:.2f}%</b> of the slice."
+                   + ("" if level == "High" else " Reliability is not high, so review before relying on it."))
 
-tone = "var(--ok)" if level == "High" else "var(--warn)"
+tone = "var(--ok)" if level == "High" else "var(--bad)" if level == "Low" else "var(--warn)"
 st.markdown(f'<div class="banner" style="--c:{tone}"><span class="tt">{title}</span><div>{summary}</div></div>', unsafe_allow_html=True)
+if ood:
+    st.warning("This image may not be a brain MRI slice. " + " ".join(ood) + " Treat the result as unreliable.")
 
 lvl_col = {"High": "var(--ok)", "Medium": "var(--warn)", "Low": "var(--bad)"}[level]
 k = st.columns(4)
-for col, lab_, v_, sty in [(k[0], "Likely type" if conflict else "Diagnosis", final_name, ""),
-                           (k[1], "Type confidence" if conflict else "Confidence", f"{final_conf*100:.1f}%", ""),
+for col, lab_, v_, sty in [(k[0], "Result", final_name, ""),
+                           (k[1], conf_label, f"{final_conf*100:.1f}%", ""),
                            (k[2], "Lesion area", f"{area:.2f}%", ""),
                            (k[3], "Reliability", level, f"color:{lvl_col}")]:
     col.markdown(f'<div class="kpi"><div class="l">{lab_}</div><div class="v" style="{sty}">{v_}</div></div>', unsafe_allow_html=True)
 
 # ───────────────────────── VISUAL INSPECTION ─────────────────────────
 st.markdown("### Visual inspection")
-overlay = blend_mask(disp, mask, alpha) if mask.any() else disp
+overlay = blend_mask(disp, mask_view, alpha) if mask_view.any() else disp
 heat = blend_heat(disp, attr, alpha) if attr is not None else None
 panels = [disp, overlay] + ([heat] if heat is not None else [])
-captions = ["Resized model input", f"Predicted mask · threshold {seg_thr:.2f}"] + (["Model attribution (experimental)"] if heat is not None else [])
+captions = ["Resized model input", f"Predicted mask · overlay threshold {seg_thr:.2f}"] + (["Model attribution (experimental)"] if heat is not None else [])
 for col, img_, cap_ in zip(st.columns(len(panels), gap="medium"), panels, captions):
     col.markdown(f'<div class="cap">{cap_}</div>', unsafe_allow_html=True)
-    col.image(img_, use_container_width=True)
+    stretch(col.image, img_)
 
 st.write("")
 cl, cr = st.columns([3, 2], gap="large")
@@ -542,73 +722,58 @@ with cr:
 
 # ───────────────────────── EXPORT ─────────────────────────
 st.markdown("### Export")
-settings_txt = (f"threshold {seg_thr:.2f}; auto-crop {'on' if crop else 'off'}; intensity alignment {'on' if robust else 'off'}; "
+settings_txt = (f"decision threshold {DEC_THR:.2f}; overlay threshold {seg_thr:.2f}; min lesion {MIN_LESION_PCT:.2f}%; "
+                f"fragment mean/peak {COMP_MEAN:.2f}/{COMP_PEAK:.2f}; auto-crop {'on' if crop else 'off'}; "
+                f"intensity alignment {'on' if robust else 'off'}; "
                 f"multi-view {'on' if multiview else 'off'} ({n_views} views); temperature {T:.2f}")
 sha = hashlib.sha1(img_bytes).hexdigest()[:10]
 report = {
-    "diagnosis": final_name, "confidence": round(final_conf, 4), "raw_prediction": CLASSES[pred],
-    "heads_disagree": bool(conflict), "reliability": level, "view_agreement": round(agree, 3),
-    "lesion_area_percent": round(area, 3), "lesion_confidence": round(les_conf, 3),
+    "result": final_name, "decision_state": state, "confidence": round(final_conf, 4), "confidence_is": conf_label,
+    "raw_prediction": CLASSES[pred], "heads_disagree": bool(conflict), "reliability": level, "view_agreement": round(agree, 3),
+    "lesion_area_percent": round(area, 3), "mask_removed_as_false_positive": state == "fp", "segmentation_view_agreement": round(seg_cons, 3), "lesion_confidence": round(les_conf, 3),
     "probabilities": {c: round(float(p), 4) for c, p in zip(CLASSES, probs)},
     "tumour_type_ranking": {n: round(p, 4) for n, p in type_rank},
-    "settings": settings_txt, "image_sha1": sha,
+    "settings": settings_txt, "input_warnings": ood, "image_sha1": sha,
 }
 png = png_bytes(np.hstack([titled(p, c) for p, c in zip(panels, captions)]))
 
 e1, e2 = st.columns(2)
-e1.download_button("Download prediction report (JSON)", json.dumps(report, indent=2), "prediction_report.json", "application/json", use_container_width=True)
-e2.download_button("Download visualization (PNG)", png, "visualization.png", "image/png", use_container_width=True)
+stretch(e1.download_button, "Download prediction report (JSON)", json.dumps(report, indent=2), "prediction_report.json", "application/json")
+stretch(e2.download_button, "Download visualization (PNG)", png, "visualization.png", "image/png")
 
 st.markdown("##### Full report (PDF)")
-st.caption("Fill in the details below. These will be included in the downloaded PDF report.")
+st.caption("Fill in the details you want printed. Leave a field empty to print a dash. Use English letters for names.")
 c1, c2, c3 = st.columns(3)
-patient = c1.text_input("Patient name", placeholder="e.g. Md. Rahim")
-pid = c2.text_input("Patient ID", placeholder="e.g. PID-10923")
+patient = c1.text_input("Patient name")
+pid = c2.text_input("Patient ID")
 agesex = c3.text_input("Age / Sex", placeholder="e.g. 45 / M")
 d1, d2, d3 = st.columns(3)
 doctor = d1.text_input("Doctor name", placeholder="Dr. ...")
-desig = d2.text_input("Designation / Reg. no.", placeholder="MBBS, FCPS")
-facility = d3.text_input("Hospital / Clinic", placeholder="KYAU Hospital")
+desig = d2.text_input("Designation / Reg. no.")
+facility = d3.text_input("Hospital / Clinic")
 notes = st.text_area("Clinical notes (optional)", height=80)
+
+doctor, desig, facility = (doctor.strip() or def_doctor.strip(), desig.strip() or def_desig.strip(),
+                           facility.strip() or def_facility.strip())
+missing = [n for n, v in [("Patient name", patient), ("Patient ID", pid), ("Age / Sex", agesex),
+                          ("Doctor name", doctor), ("Designation", desig), ("Hospital / Clinic", facility)] if not v.strip()]
+if missing:
+    st.warning("Not filled yet (will print as 'Not provided'): " + ", ".join(missing) + ". "
+               "Doctor, designation and hospital can be saved once under Report defaults in the sidebar.")
+else:
+    st.success("All report fields are filled.")
+if any(ord(ch) > 255 for ch in patient + doctor + facility + notes):
+    st.warning("Some characters are not Latin (e.g. Bengali letters) and will print as '?' in the PDF. Write names in English letters.")
 
 if HAS_PDF:
     info = dict(patient=patient, pid=pid, agesex=agesex, doctor=doctor, desig=desig, facility=facility, notes=notes,
                 date=datetime.now(TZ).strftime("%d %b %Y, %I:%M %p"))
     r = dict(name=final_name, conf=final_conf, area=area, level=level, summary=summary, title=title, probs=probs, pred=pred,
              checks=checks, settings=settings_txt, sha=sha, rid=f"MRI-{sha.upper()}",
-             types=type_rank if (final_idx != NO_TUMOR) else [])
+             types=type_rank if state in ("tumour", "conflict", "no_mask") else [], conf_label=conf_label)
     pdf = build_pdf(info, r, [png_bytes(p, 448) for p in panels], captions)
-    st.download_button("Download full report (PDF)", pdf, f"MRI_report_{sha}.pdf", "application/pdf", use_container_width=True, type="primary")
+    stretch(st.download_button, "Download full report (PDF)", pdf, f"MRI_report_{sha}.pdf", "application/pdf", type="primary")
 else:
     st.info("PDF export needs `reportlab`. Add it to requirements.txt and redeploy.")
 
 st.markdown('<div class="note">Research prototype for a thesis project. Not a medical device and not for clinical decisions.</div>', unsafe_allow_html=True)
-'''
-REQ = "streamlit\nonnxruntime\nnumpy\nopencv-python-headless\npillow\nreportlab\n"
-README = """# TinyBrainNet-MT ({tag})
-Brain MRI: tumour type + lesion outline + attribution map + PDF report. Research prototype, not a medical device.
-
-Deploy: put the files of this folder in the ROOT of your GitHub repo (app.py, requirements.txt, model/, samples/),
-then on https://share.streamlit.io create / reboot the app with main file `app.py`.
-Local run: pip install -r requirements.txt && streamlit run app.py
-"""
-built = []
-for tag in ("p15", "p16", "merged"):
-    src = WORK / f"deployment_bundle_robust_{tag}"
-    if not (src / "model" / "tinybrainnet.onnx").exists():
-        print(f"[skip {tag}] {src} not found -> run the Part-17 cell for {tag} first"); continue
-    out = WORK / f"brain_tumor_app_{tag}"
-    if out.exists(): shutil.rmtree(out)
-    shutil.copytree(src / "model", out / "model")
-    if (src / "samples").exists(): shutil.copytree(src / "samples", out / "samples")
-    else: (out / "samples").mkdir()
-    (out / "app.py").write_text(APP_PY, encoding="utf-8")
-    (out / "requirements.txt").write_text(REQ)
-    (out / "README.md").write_text(README.format(tag=tag))
-    zp = WORK / f"brain_tumor_app_{tag}.zip"
-    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in out.rglob("*"):
-            if p.is_file(): z.write(p, p.relative_to(out))
-    built.append(zp); print(f"[OK] {zp}  ({zp.stat().st_size/1e6:.1f} MB)")
-
-print("\n[SUCCESS] Fixed App Builder executed successfully! New corrected zip files generated.")
