@@ -1,0 +1,34 @@
+[
+ {
+  "file": "glioma_brisc2025_test_00168_gl_sa_t1.jpg",
+  "label": "glioma"
+ },
+ {
+  "file": "glioma_brisc2025_test_00226_gl_sa_t1.jpg",
+  "label": "glioma"
+ },
+ {
+  "file": "meningioma_brisc2025_test_00527_me_sa_t1.jpg",
+  "label": "meningioma"
+ },
+ {
+  "file": "meningioma_brisc2025_test_00398_me_co_t1.jpg",
+  "label": "meningioma"
+ },
+ {
+  "file": "pituitary_brisc2025_test_00839_pi_co_t1.jpg",
+  "label": "pituitary"
+ },
+ {
+  "file": "pituitary_brisc2025_test_00972_pi_sa_t1.jpg",
+  "label": "pituitary"
+ },
+ {
+  "file": "no_tumor_brisc2025_test_00651_no_co_t1.jpg",
+  "label": "no_tumor"
+ },
+ {
+  "file": "no_tumor_brisc2025_test_00594_no_ax_t1.jpg",
+  "label": "no_tumor"
+ }
+]

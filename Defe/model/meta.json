@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "name": "TinyBrainNet-MT",
+  "version": "2.0.0-robust-merged",
+  "variant": "robust-merged",
+  "dummy": false,
+  "onnx_file": "tinybrainnet.onnx",
+  "created_utc": "2026-11-03T10:02:02.744965+00:00",
+  "input": {
+    "name": "input",
+    "size": 224,
+    "mean": [
+      0.17246411740779877,
+      0.17246411740779877,
+      0.17246411740779877
+    ],
+    "std": [
+      0.18363456428050995,
+      0.18363456428050995,
+      0.18363456428050995
+    ],
+    "layout": "NCHW",
+    "resize": "area (cv2.INTER_AREA)",
+    "colour": "RGB"
+  },
+  "outputs": {
+    "cls": "cls_logits",
+    "seg": "seg_logits",
+    "cam": "cam",
+    "segmentation_is_probability": false
+  },
+  "classes": [
+    "Glioma",
+    "Meningioma",
+    "Pituitary",
+    "No_tumor"
+  ],
+  "calibration": {
+    "temperature": 0.7832405220841822,
+    "fit_on": "Nickparvar Testing (clean) + BRISC test-like logits"
+  },
+  "triage": {
+    "auto": 0.88,
+    "review": 0.51
+  },
+  "segmentation": {
+    "threshold": 0.5,
+    "min_area_px": 20
+  },
+  "app_defaults": {
+    "intensity_alignment": false,
+    "multi_view": true,
+    "soften_probabilities": true,
+    "picked_by": "mean external accuracy (Nickparvar Testing clean + Figshare held-out patients)",
+    "picked_input": "plain"
+  },
+  "metrics": {
+    "input": "plain",
+    "brisc acc %": 96.9,
+    "nick_val acc %": 89.56,
+    "fig_heldout acc %": 99.65,
+    "Dice@224 (BRISC test)": 0.7968,
+    "FP on normal % (Nick val)": 3.5
+  },
+  "model_info": {
+    "params_m": 0.496573,
+    "onnx_mb": 2.010375,
+    "onnx_cpu_ms_1thread": 9.459010499995202
+  },
+  "verification": {
+    "logit_max_abs_diff": 2.3484230041503906e-05,
+    "argmax_agreement": 1.0,
+    "mask_iou": 1.0,
+    "ok": true
+  },
+  "license": "research / education only - not a medical device",
+  "notes": "Fine-tuned with watermark/JPEG/blur/contrast augmentation + Nickparvar training split + healthy-slice negatives for the mask head."
+}
